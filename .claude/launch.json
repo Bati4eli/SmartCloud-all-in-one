@@ -4,7 +4,14 @@
     {
       "name": "web-client",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["--prefix", "SmartCloud-Frontend", "start", "--", "--port", "4200"],
+      "runtimeArgs": [
+        "--prefix",
+        "SmartCloud-Frontend",
+        "start",
+        "--",
+        "--port",
+        "4200"
+      ],
       "port": 4200
     }
   ]

@@ -198,7 +198,7 @@ flowchart LR
 
 ## 🏗️ Архитектура
 
-Микросервисы на Java/Groovy и Python, общий gRPC-контракт для всех клиентов и одна база PostgreSQL, в которой живут гео-индексы и векторы.
+Микросервисы на Java/Groovy и Python, общий gRPC-контракт для всех клиентов, одна база PostgreSQL с гео-индексами и векторами и S3-хранилище для файлов. Общего тома между контейнерами нет.
 
 ```mermaid
 ---
@@ -229,10 +229,10 @@ flowchart TB
     Rest -->|gRPC| Main
 
     Main <-->|задачи обработки| Kafka["📨 kafka<br/>+ zookeeper"]
-    Main -->|gRPC| Face
-    Main -->|gRPC| Embed
-    Main -->|HTTP| Geo
-    Main -->|HTTP| VLM
+    Main -->|"gRPC · ссылка на оригинал"| Face
+    Main -->|"gRPC · байты превью"| Embed
+    Main -->|"HTTP · ссылка на оригинал"| Geo
+    Main -->|"HTTP · байты превью"| VLM
 
     subgraph AI["Обработка медиа · Python + GPU"]
         direction LR
@@ -248,15 +248,16 @@ flowchart TB
         direction LR
         Db[("🗄️ postgresql<br/>PostGIS · pgvector")]
         Redis[("⚡ redis")]
-        Files[("💾 том /data<br/>оригиналы и превью")]
+        S3[("🪣 s3-storage<br/>SeaweedFS · S3 API<br/>оригиналы, превью, лица")]
     end
 
     Main -->|JDBC| Db
     Rest -->|JDBC| Db
     Main -->|кэш| Redis
-    Main --- Files
-    Rest --- Files
-    AI -.->|читают файлы| Files
+    Main -->|S3| S3
+    Rest -->|S3| S3
+    Face -.->|presigned URL| S3
+    Geo -.->|presigned URL| S3
 
     Mon["📈 prometheus · grafana"] -.->|метрики| Main
 ```
@@ -278,16 +279,20 @@ sequenceDiagram
     participant CV as face-detector · location-preview
     participant AI as ai-ollama · image-embedder
     participant DB as postgresql
+    participant S3 as s3-storage
 
     Phone->>REST: автозагрузка нового снимка
+    REST->>S3: оригинал целиком из локального staging
     REST->>Main: файл сохранён, запусти обработку
     Main->>DB: EXIF: дата, камера, GPS
     Main->>K: задача на обработку
     K-->>Main: обработка в фоне
-    Main->>CV: превью, адрес по координатам, лица
-    CV-->>Main: превью в /data, адрес, лица с векторами
+    Main->>CV: presigned URL оригинала: превью, адрес, лица
+    CV->>S3: скачивают оригинал по ссылке
+    CV-->>Main: превью и аватары лиц байтами, адрес, векторы лиц
+    Main->>S3: превью и аватары лиц
     Main->>DB: лица и их векторы
-    Main->>AI: вектор кадра, текст на фото, проверка чувствительности
+    Main->>AI: байты превью: вектор кадра, текст на фото, проверка чувствительности
     AI-->>Main: результат анализа
     Main->>DB: категория, вектор (pgvector), кластер карты (PostGIS)
     Main-->>Phone: событие в живом потоке — фото готово
@@ -299,6 +304,7 @@ sequenceDiagram
 | --- | --- |
 | **Contract-first gRPC** | Один набор `.proto` порождает код для Java-сервера, TypeScript-клиента (gRPC-Web) и Android. Галереи, лента и события приходят server-streaming'ом, поэтому экран рисуется по мере получения данных. |
 | **Одна база вместо трёх** | PostgreSQL + PostGIS + pgvector: гео-запросы, поиск ближайших векторов и фасеты с подсчётом выполняются одним SQL. Отдельные поисковый движок и векторная БД не нужны. |
+| **Объектное хранилище** | Файлы лежат в S3 (SeaweedFS) под ключами `{userId}/ORIGINAL/{fileId}`; имена и дерево папок живут только в БД, поэтому переименование и перенос мгновенны. ИИ-сервисы не имеют доступа к хранилищу: получают ссылку или байты, а результат сохраняет Java. |
 | **Асинхронный конвейер** | Загрузка отвечает сразу, тяжёлая обработка идёт через Kafka. Пересчёт старых фото (новые векторы, перестроение карты) ставится в очередь фоновых задач. |
 | **Мультиязычный CLIP** | `jina-clip-v2` переводит фото и текст запроса в одно векторное пространство. Запрос на русском находит кадр без машинного перевода. |
 | **Предрасчитанная карта** | Кластеры для 15 уровней масштаба готовятся заранее, карта не считает их на лету. |

@@ -198,75 +198,100 @@ flowchart LR
 
 ## 🏗️ Архитектура
 
-Микросервисы на Java/Groovy и Python, общий gRPC-контракт для всех клиентов, одна база PostgreSQL с гео-индексами и векторами и S3-хранилище для файлов. Общего тома между контейнерами нет.
+Микросервисы на Java/Groovy и Python, общий gRPC-контракт для всех клиентов, одна база PostgreSQL с гео-индексами и векторами и S3-хранилище для файлов. Общий том между контейнерами один — `processing` для свежих загрузок, пока их обрабатывают.
+
+### Обзор
 
 ```mermaid
----
-config:
-  flowchart:
-    nodeSpacing: 18
-    rankSpacing: 28
-    padding: 10
-    wrappingWidth: 240
----
 flowchart TB
     subgraph Clients["Клиенты"]
         direction LR
-        Web["🌐 Web / PWA<br/>Angular 21 · Material 3"]
-        Android["📱 Android<br/>Java · автозагрузка"]
-        Desktop["🖥️ Desktop<br/>.NET MAUI · ранний этап"]
+        Web["🌐 Web / PWA"]
+        Android["📱 Android"]
+        Desktop["🖥️ Desktop"]
     end
 
+    Nginx["🚪 Nginx · TLS<br/>маршрут по имени метода"]
     Web -->|gRPC-Web · REST| Nginx
     Android -->|gRPC · REST| Nginx
     Desktop -->|gRPC| Nginx
 
-    Nginx["🚪 app-cloud-frontend<br/>Nginx · TLS · статика веб-клиента"]
-    Nginx -->|gRPC-Web| Proxy["🔀 grpc-web-proxy"]
-    Nginx -->|REST| Rest["📤 app-cloud-rest-backend<br/>загрузка, превью, видео"]
-    Nginx -->|gRPC| Main["⚙️ app-cloud-main-backend<br/>файлы, медиа, поиск"]
-    Proxy -->|gRPC| Main
-    Rest -->|gRPC| Main
-
-    Main <-->|задачи обработки| Kafka["📨 kafka<br/>+ zookeeper"]
-    Main -->|"gRPC · путь к рабочей копии"| Face
-    Main -->|"gRPC · байты превью"| Embed
-    Main -->|"HTTP · путь к рабочей копии"| Geo
-    Main -->|"HTTP · байты превью"| VLM
-
-    subgraph AI["Обработка медиа · Python + GPU"]
+    subgraph Backend["Бэкенд · Java"]
         direction LR
-        Face["👤 app-face-detector<br/>InsightFace"]
-        Embed["🔎 app-image-embedder<br/>jina-clip-v2"]
-        Geo["🗺️ app-location-preview<br/>превью и геокодинг"]
-        VLM["🧠 ai-ollama<br/>Qwen VL"]
+        Api["⚙️ API<br/>метаданные, поиск"]
+        Files["📤 Файлы<br/>все байты"]
+        Realtime["📡 Живые<br/>события"]
+        Worker["🏭 Фоновая<br/>обработка"]
     end
 
-    Geo -.->|координаты| OSM["🌍 Nominatim · OpenStreetMap"]
+    Nginx --> Api
+    Nginx --> Files
+    Nginx --> Realtime
+    Files -->|очередь| Worker
 
-    subgraph Data["Хранение"]
-        direction LR
-        Db[("🗄️ postgresql<br/>PostGIS · pgvector")]
-        Redis[("⚡ redis")]
-        S3[("🪣 s3-storage<br/>SeaweedFS · S3 API<br/>оригиналы, превью, лица")]
-        Proc[("📂 том processing<br/>файлы в обработке")]
-    end
+    AI["🧠 ИИ · Python + GPU<br/>лица, векторы, VLM"]
+    Data[("🗄️ PostgreSQL<br/>Redis · S3")]
 
-    Main -->|JDBC| Db
-    Rest -->|JDBC| Db
-    Main -->|кэш| Redis
-    Main -->|S3| S3
-    Rest -->|S3| S3
-    Rest -->|рабочая копия| Proc
-    Main -->|рабочая копия| Proc
-    Face -.->|читает свежую загрузку| Proc
-    Geo -.->|читает свежую загрузку| Proc
-
-    Mon["📈 prometheus · grafana"] -.->|метрики| Main
+    Files --> AI
+    Worker --> AI
+    Api --> Data
+    Files --> Data
+    Realtime --> Data
+    Worker --> Data
 ```
 
+### Связи внутри бэкенда
+
+```mermaid
+flowchart TB
+    Nginx["🚪 app-cloud-frontend<br/>Nginx: выбор сервиса<br/>по имени метода"]
+
+    Api["⚙️ app-cloud-api × N<br/>метаданные, альбомы, лица,<br/>теги, поиск, шаринг, вход"]
+    Files["📤 app-cloud-file-gateway × N<br/>upload, download, видео,<br/>превью, ZIP; EXIF и превью<br/>загрузки до ответа"]
+    Realtime["📡 app-cloud-realtime-gateway × N<br/>subscribe_events, heartbeat"]
+
+    Nginx -->|gRPC метаданных| Api
+    Nginx -->|"REST и gRPC с байтами"| Files
+    Nginx -->|subscribe_events| Realtime
+
+    Kafka["📨 kafka<br/>свежие загрузки<br/>6 партиций, повторы, DLT"]
+    TaskTable[("🗂️ scheduled_tasks<br/>пересчёты, повторы")]
+    Files --> Kafka
+    Api --> TaskTable
+
+    subgraph Worker["🏭 app-cloud-media-worker × N"]
+        direction LR
+        Consumer["📨 Kafka-конвейер<br/>лица, автотеги, VLM"]
+        Tasks["🗂️ Обработчики задач<br/>ENRICH_MEDIA<br/>LOCATE_MEDIA<br/>RELOCATE_ALL<br/>REBUILD_MAP<br/>EMBED_IMAGES<br/>ANALYZE_AI<br/>FIND_LIVE_VIDEOS<br/>RESCAN / REDETECT /<br/>MERGE_FACES"]
+        Jobs["⏱️ Периодические работы<br/>кластеры карты, корзина,<br/>сессии, ANALYZE<br/>ShedLock: одна реплика"]
+    end
+
+    Kafka -->|партиции<br/>на реплики| Consumer
+    TaskTable -->|SKIP LOCKED| Tasks
+
+    AI["🧠 ИИ · Python + GPU<br/>face-detector<br/>image-embedder<br/>location-preview<br/>ollama · Qwen VL"]
+    Data[("🗄️ postgresql<br/>PostGIS · pgvector<br/>🪣 s3-storage<br/>📂 том processing")]
+    Redis[("⚡ redis<br/>кэш, канал событий")]
+
+    Files -->|превью, вектор| AI
+    Worker -->|лица, VLM,<br/>пересчёты| AI
+    Api --> Data
+    Files --> Data
+    Worker --> Data
+    Worker -->|события| Redis
+    Redis -.->|в открытые потоки| Realtime
+```
+
+Свежая загрузка лежит рабочей копией на томе `processing`. Её читают шлюз файлов, `location-preview` и `face-detector`, а удаляет воркер после фоновой обработки. События клиентам в Redis пишут воркер, API и шлюз файлов. Каждая реплика realtime-gateway отдаёт их в свои открытые потоки. API ещё обращается к VLM за переводом поисковых запросов. Метрики собирают Prometheus и Grafana.
+
 > [!NOTE]
-> **`app-cloud-main-backend` планируется декомпозировать на микросервисы.** Сейчас в нём собраны файлы, медиа, лица, альбомы, теги и поиск. Эти домены будут вынесены в отдельные сервисы с собственными gRPC-контрактами.
+> **Бэкенд разделён по профилю нагрузки.**
+> - `app-cloud-api` отвечает на запросы метаданных и не хранит состояния.
+> - `app-cloud-file-gateway` передаёт все байты файлов.
+> - `app-cloud-realtime-gateway` держит долгие потоки событий.
+> - `app-cloud-media-worker` выполняет фоновую обработку.
+>
+> Каждый сервис масштабируется отдельно и запускается в нескольких репликах. Домены файлов, медиа, лиц и поиска живут в общем ядре `lib-cloud-core`: их связывают общие SQL-запросы и транзакции.
 
 <a name="photo-pipeline"></a>
 
@@ -276,31 +301,33 @@ flowchart TB
 sequenceDiagram
     autonumber
     participant Phone as 📱 Android
-    participant REST as app-cloud-rest-backend
-    participant Main as app-cloud-main-backend
+    participant FG as app-cloud-file-gateway
     participant K as kafka
+    participant W as app-cloud-media-worker
     participant CV as face-detector · location-preview
     participant AI as ai-ollama · image-embedder
     participant DB as postgresql
     participant S3 as s3-storage
+    participant RT as app-cloud-realtime-gateway
 
-    Phone->>REST: загрузка нового снимка
-    REST->>S3: оригинал целиком
-    REST->>Main: файл сохранён, рабочая копия на томе processing
-    Main->>CV: путь к рабочей копии: превью
-    CV-->>Main: превью байтами
-    Main->>S3: превью
-    Main->>DB: EXIF, место, вектор превью (pgvector)
-    Main-->>Phone: ответ на загрузку: превью и EXIF готовы
-    Main->>K: задача на фоновую обработку
-    K-->>Main: обработка в фоне
-    Main->>CV: путь к рабочей копии: лица
-    CV-->>Main: аватары и векторы лиц
-    Main->>S3: аватары лиц
-    Main->>AI: байты превью: текст на фото, проверка чувствительности
-    Main->>DB: лица, категории, кластер карты (PostGIS)
-    Main->>Main: удаляет рабочую копию после конца синхронной части
-    Main-->>Phone: событие в живом потоке — фото обработано
+    Phone->>FG: загрузка нового снимка (gRPC или REST)
+    FG->>S3: оригинал целиком
+    FG->>CV: путь к рабочей копии: превью
+    CV-->>FG: превью байтами
+    FG->>S3: превью
+    FG->>AI: байты превью: вектор
+    FG->>DB: EXIF, место, вектор превью (pgvector)
+    FG-->>Phone: ответ на загрузку: превью и EXIF готовы
+    FG->>K: задача на фоновую обработку
+    K-->>W: задача достаётся одной реплике воркера
+    W->>CV: путь к рабочей копии: лица
+    CV-->>W: аватары и векторы лиц
+    W->>S3: аватары лиц
+    W->>AI: байты превью: текст на фото, проверка чувствительности
+    W->>DB: лица, категории, кластер карты (PostGIS)
+    W->>W: удаляет рабочую копию после конца синхронной части
+    W-->>RT: событие через Redis Pub/Sub
+    RT-->>Phone: событие в живом потоке — фото обработано
 ```
 
 ## 💡 Инженерные решения
